@@ -5,7 +5,8 @@ import { convertToMd, getConverter, CONVERTERS, ACCEPT } from "./convert.js";
 import { baseName } from "./utils/markdown.js";
 
 const $ = (id) => document.getElementById(id);
-const items = [];          // { id, file, name, converter, status, progress, md, error }
+// { id, file, name, converter, status, progress, md, assets, urls, error }
+const items = [];
 let selected = null;
 let view = "src";
 let seq = 0;
@@ -14,6 +15,7 @@ let seq = 0;
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const fmtSize = (b) => b < 1024 ? b + " o" : b < 1048576 ? (b / 1024).toFixed(1) + " Ko" : (b / 1048576).toFixed(1) + " Mo";
+const plural = (n, word) => `${n} ${word}${n > 1 ? "s" : ""}`;
 
 function saveBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
@@ -39,13 +41,17 @@ async function convert(item) {
   item.status = "working";
   render();
   try {
-    item.md = await convertToMd(item.file, {
+    const result = await convertToMd(item.file, {
+      images: $("opt-images").checked,
+      metadata: $("opt-meta").checked,
       ocr: $("opt-ocr").checked,
       requestPassword: askPassword,
       onProgress: (done, total, label = "Page") => {
         if (total > 1 || label !== "Page") { item.progress = `${label} ${done} / ${total}`; render(); }
       },
     });
+    item.md = result.markdown;
+    item.assets = result.assets;
     item.status = "done";
     if (!selected) selected = item.id;
   } catch (e) {
@@ -82,7 +88,7 @@ function addFiles(fileList) {
   for (const file of fileList) {
     const converter = getConverter(file.name);
     if (!converter) { rejected.push(file.name); continue; }
-    const item = { id: ++seq, file, name: file.name, converter, status: "pending", progress: "", md: "", error: "" };
+    const item = { id: ++seq, file, name: file.name, converter, status: "pending", progress: "", md: "", assets: [], urls: null, error: "" };
     items.push(item);
     queue.push(item);
   }
@@ -92,12 +98,27 @@ function addFiles(fileList) {
 }
 
 /* ---------------------------------------------------------------- actions */
-const download = (item) =>
-  saveBlob(new Blob([item.md], { type: "text/markdown;charset=utf-8" }), baseName(item.name) + ".md");
+
+// Un document avec images est téléchargé en .zip (Markdown + dossier images/).
+async function download(item) {
+  const name = baseName(item.name);
+  if (!item.assets.length) {
+    saveBlob(new Blob([item.md], { type: "text/markdown;charset=utf-8" }), name + ".md");
+    return;
+  }
+  const zip = new JSZip();
+  zip.file(name + ".md", item.md);
+  for (const a of item.assets) zip.file(a.path, a.blob);
+  saveBlob(await zip.generateAsync({ type: "blob" }), name + ".zip");
+}
 
 async function copy(item) {
-  try { await navigator.clipboard.writeText(item.md); toast("Markdown copié"); }
-  catch { toast("Copie impossible dans ce navigateur", "pi-exclamation-triangle"); }
+  try {
+    await navigator.clipboard.writeText(item.md);
+    toast(item.assets.length ? "Markdown copié (sans les images)" : "Markdown copié");
+  } catch {
+    toast("Copie impossible dans ce navigateur", "pi-exclamation-triangle");
+  }
 }
 
 async function downloadZip() {
@@ -110,13 +131,20 @@ async function downloadZip() {
     for (let k = 2; used.has(name); k++) name = `${baseName(it.name)} (${k}).md`;
     used.add(name);
     zip.file(name, it.md);
+    for (const a of it.assets) zip.file(a.path, a.blob);
   }
   saveBlob(await zip.generateAsync({ type: "blob" }), "markdown.zip");
 }
 
+function releaseUrls(item) {
+  if (!item?.urls) return;
+  for (const url of item.urls.values()) URL.revokeObjectURL(url);
+  item.urls = null;
+}
+
 function remove(id) {
   const i = items.findIndex((x) => x.id === id);
-  if (i >= 0) items.splice(i, 1);
+  if (i >= 0) { releaseUrls(items[i]); items.splice(i, 1); }
   if (selected === id) selected = items.find((x) => x.status === "done")?.id ?? null;
   render();
 }
@@ -126,8 +154,25 @@ function statusHtml(it) {
   switch (it.status) {
     case "pending": return `<i class="pi pi-clock"></i>En attente`;
     case "working": return `<i class="pi pi-spin pi-spinner"></i>${esc(it.progress || "Conversion…")}`;
-    case "done": return `<i class="pi pi-check-circle ok"></i><span>Converti · ${fmtSize(new Blob([it.md]).size)}</span>`;
+    case "done": {
+      const images = it.assets.length ? ` · ${plural(it.assets.length, "image")}` : "";
+      return `<i class="pi pi-check-circle ok"></i><span>Converti · ${fmtSize(new Blob([it.md]).size)}${images}</span>`;
+    }
     case "error": return `<i class="pi pi-times-circle err"></i><span class="err-text">${esc(it.error)}</span>`;
+  }
+}
+
+// Aperçu rendu : sans l'en-tête YAML, avec les images du document.
+function renderPreview(item) {
+  const md = item.md.replace(/^---\n[\s\S]*?\n---\n+/, "");
+  const target = $("rendered");
+  target.innerHTML = DOMPurify.sanitize(marked.parse(md));
+  if (item.assets.length && !item.urls) {
+    item.urls = new Map(item.assets.map((a) => [a.path, URL.createObjectURL(a.blob)]));
+  }
+  for (const img of target.querySelectorAll("img")) {
+    const url = item.urls?.get(img.getAttribute("src"));
+    if (url) img.src = url;
   }
 }
 
@@ -139,6 +184,7 @@ function render() {
   $("list").innerHTML = items.map((it) => {
     const { kind, icon } = it.converter;
     const ok = it.status === "done";
+    const dlTitle = it.assets.length ? "Télécharger (.zip avec les images)" : "Télécharger le .md";
     return `<li class="file${selected === it.id ? " active" : ""}" data-id="${it.id}">
       <div class="ficon ${kind}"><i class="pi ${icon}"></i></div>
       <div class="fmain">
@@ -147,7 +193,7 @@ function render() {
       </div>
       <div class="fact">
         <button class="icon-btn" data-act="copy" title="Copier le Markdown" aria-label="Copier" ${ok ? "" : "disabled"}><i class="pi pi-copy"></i></button>
-        <button class="icon-btn" data-act="dl" title="Télécharger le .md" aria-label="Télécharger" ${ok ? "" : "disabled"}><i class="pi pi-download"></i></button>
+        <button class="icon-btn" data-act="dl" title="${dlTitle}" aria-label="Télécharger" ${ok ? "" : "disabled"}><i class="pi pi-download"></i></button>
         <button class="icon-btn danger" data-act="rm" title="Retirer" aria-label="Retirer"><i class="pi pi-times"></i></button>
       </div>
     </li>`;
@@ -157,10 +203,11 @@ function render() {
   $("preview-card").classList.toggle("hidden", !sel);
   if (!sel) return;
   $("preview-name").textContent = baseName(sel.name) + ".md";
+  $("p-dl-label").textContent = sel.assets.length ? ".zip" : ".md";
   $("source").textContent = sel.md;
   $("source").classList.toggle("hidden", view !== "src");
   $("rendered").classList.toggle("hidden", view !== "render");
-  if (view === "render") $("rendered").innerHTML = DOMPurify.sanitize(marked.parse(sel.md));
+  if (view === "render") renderPreview(sel);
   $("tab-src").classList.toggle("on", view === "src");
   $("tab-render").classList.toggle("on", view === "render");
 }
@@ -205,7 +252,7 @@ $("pwd-input").addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); $("pwd-dialog").close("ok"); }
 });
 
-$("clear").addEventListener("click", () => { items.length = 0; selected = null; render(); });
+$("clear").addEventListener("click", () => { items.forEach(releaseUrls); items.length = 0; selected = null; render(); });
 $("zip").addEventListener("click", downloadZip);
 $("tab-src").addEventListener("click", () => { view = "src"; render(); });
 $("tab-render").addEventListener("click", () => { view = "render"; render(); });

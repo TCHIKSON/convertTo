@@ -1,0 +1,17 @@
+{
+  "name": "convertisseur-markdown",
+  "version": "1.0.0",
+  "description": "Convertir des fichiers PDF, Word et Excel en Markdown, directement dans le navigateur.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "python3 -m http.server 8000",
+    "test": "node tests/run.mjs"
+  },
+  "devDependencies": {
+    "mammoth": "1.6.0",
+    "pdfjs-dist": "3.11.174",
+    "turndown": "7.1.2",
+    "xlsx": "0.18.5"
+  }
+}

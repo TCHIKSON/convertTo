@@ -3,9 +3,11 @@
 // puis l'ajouter au tableau CONVERTERS ci-dessous. L'interface s'adapte seule.
 //
 // Un convertisseur exporte par défaut un objet :
-//   { id, label, kind, icon, extensions: [...], async convert(file, { onProgress }) -> string }
+//   { id, label, kind, icon, extensions: [...], async convert(file, options) }
+// convert() renvoie le Markdown (texte), ou { markdown, assets } quand il produit aussi
+// des fichiers (images) : assets = [{ path, blob }], référencés dans le Markdown par `path`.
 
-import pdf from "./converters/pdf.js";
+import pdf from "./converters/pdf/index.js";
 import docx from "./converters/docx.js";
 import xlsx from "./converters/xlsx.js";
 
@@ -25,12 +27,13 @@ export const getConverter = (name) => byExtension.get(extOf(name)) || null;
 
 /**
  * Convertit un fichier (File ou objet { name, arrayBuffer() }) en Markdown.
- * @param {File} file
- * @param {{ onProgress?: (done: number, total: number) => void }} [options]
- * @returns {Promise<string>}
+ * Les options sont transmises au convertisseur, qui utilise celles qui le concernent :
+ *   onProgress(done, total, label), ocr, images, metadata, requestPassword(fileName, retry)
+ * @returns {Promise<{ markdown: string, assets: { path: string, blob: Blob }[] }>}
  */
 export async function convertToMd(file, options = {}) {
   const converter = getConverter(file.name);
   if (!converter) throw new Error(`Format non pris en charge : .${extOf(file.name)}`);
-  return converter.convert(file, options);
+  const result = await converter.convert(file, options);
+  return typeof result === "string" ? { markdown: result, assets: [] } : result;
 }
