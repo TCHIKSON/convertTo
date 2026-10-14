@@ -40,8 +40,10 @@ async function convert(item) {
   render();
   try {
     item.md = await convertToMd(item.file, {
-      onProgress: (done, total) => {
-        if (total > 1) { item.progress = `Page ${done} / ${total}`; render(); }
+      ocr: $("opt-ocr").checked,
+      requestPassword: askPassword,
+      onProgress: (done, total, label = "Page") => {
+        if (total > 1 || label !== "Page") { item.progress = `${label} ${done} / ${total}`; render(); }
       },
     });
     item.status = "done";
@@ -49,9 +51,29 @@ async function convert(item) {
   } catch (e) {
     console.error(e);
     item.status = "error";
-    item.error = e?.name === "PasswordException" ? "PDF protégé par mot de passe" : e?.message || "Conversion impossible";
+    item.error = e?.message || "Conversion impossible";
   }
   render();
+}
+
+// Fenêtre de saisie du mot de passe d'un PDF protégé.
+// Le mot de passe sert uniquement à ouvrir le fichier ; il n'est jamais conservé.
+function askPassword(fileName, retry) {
+  return new Promise((resolve) => {
+    const dialog = $("pwd-dialog");
+    const input = $("pwd-input");
+    $("pwd-text").textContent = `« ${fileName} » est protégé par un mot de passe.`;
+    $("pwd-error").classList.toggle("hidden", !retry);
+    input.value = "";
+    dialog.returnValue = "";
+    dialog.addEventListener("close", () => {
+      const value = dialog.returnValue === "ok" ? input.value : null;
+      input.value = "";
+      resolve(value);
+    }, { once: true });
+    dialog.showModal();
+    input.focus();
+  });
 }
 
 function addFiles(fileList) {
@@ -176,6 +198,11 @@ $("list").addEventListener("click", (e) => {
   if (act === "dl") return download(it);
   if (act === "rm") return remove(id);
   if (it.status === "done") { selected = id; render(); }
+});
+
+// Entrée dans le champ mot de passe = « Ouvrir » (et non le premier bouton, « Annuler »).
+$("pwd-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); $("pwd-dialog").close("ok"); }
 });
 
 $("clear").addEventListener("click", () => { items.length = 0; selected = null; render(); });
