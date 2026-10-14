@@ -29,6 +29,15 @@
   </label>
   <div class="privacy"><i class="pi pi-shield"></i>Conversion locale dans votre navigateur. Aucun fichier n'est envoyé ni conservé.</div>
 
+  <div class="options">
+    <label class="switch">
+      <input type="checkbox" id="opt-ocr">
+      <span class="track" aria-hidden="true"></span>
+      <span class="switch-label"><i class="pi pi-image"></i>OCR pour les PDF scannés</span>
+    </label>
+    <span class="hint">Le moteur de reconnaissance est téléchargé au premier usage (environ 15 Mo). Vos fichiers restent sur votre appareil.</span>
+  </div>
+
   <section class="card hidden" id="files-card">
     <div class="toolbar">
       <h2>Fichiers<span class="count" id="count"></span></h2>
@@ -60,6 +69,19 @@
 </div>
 
 <div id="toast" role="status" aria-live="polite"><i class="pi pi-check"></i><span></span></div>
+
+<dialog id="pwd-dialog" class="dialog" aria-labelledby="pwd-title">
+  <form method="dialog">
+    <div class="dialog-head"><i class="pi pi-lock"></i><h3 id="pwd-title">PDF protégé</h3></div>
+    <p class="dialog-text" id="pwd-text"></p>
+    <input type="password" id="pwd-input" class="input" autocomplete="off" placeholder="Mot de passe">
+    <p class="dialog-error hidden" id="pwd-error"><i class="pi pi-exclamation-circle"></i>Mot de passe incorrect, réessayez.</p>
+    <div class="dialog-actions">
+      <button class="btn" type="submit" value="cancel" formnovalidate>Annuler</button>
+      <button class="btn primary" type="submit" value="ok"><i class="pi pi-lock-open"></i>Ouvrir</button>
+    </div>
+  </form>
+</dialog>
 
 <!-- Bibliothèques (exposées en variables globales, utilisées par les convertisseurs) -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>

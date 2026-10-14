@@ -1,13 +1,21 @@
 // Convertisseur PDF basé sur pdf.js (globale `pdfjsLib` chargée dans index.html).
 //
 // Étapes :
-//   1. Lecture de chaque page : fragments de texte avec position, taille et style.
+//   1. Lecture de chaque page : fragments de texte avec position, taille, style et liens.
+//      Si la page n'a pas de texte et que l'OCR est activé, l'image de la page est analysée.
 //   2. Reconstitution des lignes, avec détection des mises en page sur deux colonnes.
 //   3. Suppression des en-têtes et pieds de page répétés, et des numéros de page.
-//   4. Hiérarchie des titres calculée sur tout le document (taille de police et gras).
-//   5. Assemblage en paragraphes, listes et titres Markdown.
+//   4. Détection des tableaux à partir de l'alignement du texte.
+//   5. Hiérarchie des titres calculée sur tout le document (taille de police et gras).
+//   6. Assemblage en paragraphes, listes, tableaux et titres Markdown.
+//
+// Options de convert() :
+//   onProgress(done, total, label)       progression page par page
+//   ocr: boolean                         OCR des pages sans texte (navigateur uniquement)
+//   requestPassword(fileName, retry)     renvoie le mot de passe saisi, ou null pour annuler
 
-import { tidy } from "../utils/markdown.js";
+import { tableToMd, tidy } from "../utils/markdown.js";
+import { createOcr, ocrAvailable } from "../utils/ocr.js";
 
 const PDF_WORKER = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 
@@ -15,8 +23,11 @@ const BULLET = /^[•▪◦●○■□➢►▶✓–\-*]\s+/;
 const NUMBERED = /^(\d{1,3}|[a-z])[.)]\s+/;
 const PAGE_NUMBER = /^(page\s*)?[-–]?\s*\d{1,4}\s*[-–]?(\s*(\/|sur|of|de)\s*\d{1,4})?$/i;
 const END_OF_SENTENCE = /[.!?:;»"”)]$/;
-const ZONE = 0.09;           // part de la hauteur de page considérée comme en-tête / pied de page
+const ZONE = 0.09;              // part de la hauteur de page considérée comme en-tête / pied de page
 const MAX_HEADING_LEVELS = 4;
+const SEGMENT_GAP = 1.5;        // espace (en tailles de police) qui sépare deux blocs sur une ligne
+const TABLE_ROW_GAP = 2.6;      // écart vertical maximal entre deux lignes d'un même tableau
+const OCR_SCALE = 2;            // résolution du rendu des pages pour l'OCR
 
 const round = (v, step = 0.5) => Math.round(v / step) * step;
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
@@ -33,26 +44,63 @@ export default {
   icon: "pi-file-pdf",
   extensions: ["pdf"],
 
-  async convert(file, { onProgress } = {}) {
+  async convert(file, { onProgress, ocr = false, requestPassword } = {}) {
     const lib = globalThis.pdfjsLib;
     if (!lib.GlobalWorkerOptions.workerSrc) lib.GlobalWorkerOptions.workerSrc = PDF_WORKER;
 
-    const data = new Uint8Array(await file.arrayBuffer());
-    const doc = await lib.getDocument({ data }).promise;
+    const doc = await openDocument(lib, file, requestPassword);
+    const useOcr = ocr && ocrAvailable();
+    let ocrEngine = null;
     const pages = [];
     try {
       for (let n = 1; n <= doc.numPages; n++) {
-        onProgress?.(n, doc.numPages);
+        onProgress?.(n, doc.numPages, "Page");
         const page = await doc.getPage(n);
-        pages.push(await readPage(page, n));
+        const result = await readPage(page, n);
+        if (result.empty && useOcr) {
+          onProgress?.(n, doc.numPages, "OCR page");
+          ocrEngine ??= await createOcr();
+          result.ocrBlocks = textToParagraphs(await ocrEngine.recognize(await renderPage(page)));
+        }
+        pages.push(result);
         page.cleanup();
       }
     } finally {
+      await ocrEngine?.terminate();
       doc.destroy();
     }
-    return buildMarkdown(pages);
+    return buildMarkdown(pages, { ocr: useOcr });
   },
 };
+
+/* ------------------------------------------------------- Ouverture du fichier */
+
+// Ouvre le document et demande le mot de passe s'il est protégé.
+async function openDocument(lib, file, requestPassword) {
+  const data = new Uint8Array(await file.arrayBuffer());
+  const task = lib.getDocument({ data });
+  let cancelled = false;
+
+  task.onPassword = async (setPassword, reason) => {
+    const retry = reason === lib.PasswordResponses?.INCORRECT_PASSWORD;
+    const password = requestPassword ? await requestPassword(file.name, retry) : null;
+    if (password == null) {
+      cancelled = true;
+      task.destroy();
+    } else {
+      setPassword(password);
+    }
+  };
+
+  try {
+    return await task.promise;
+  } catch (e) {
+    if (cancelled) throw new Error("PDF protégé : mot de passe non fourni");
+    if (e?.name === "PasswordException") throw new Error("PDF protégé par mot de passe");
+    if (e?.name === "InvalidPDFException") throw new Error("Fichier PDF invalide ou endommagé");
+    throw e;
+  }
+}
 
 /* ------------------------------------------------------------------ 1. Lecture */
 
@@ -87,6 +135,8 @@ async function readPage(page, pageNumber) {
     return style;
   };
 
+  const links = await readLinks(page);
+
   // Fragments de texte (les doublons servant à simuler le gras sont ignorés).
   const seen = new Set();
   const items = [];
@@ -97,7 +147,8 @@ async function readPage(page, pageNumber) {
     const key = `${it.str}|${Math.round(x)}|${Math.round(y)}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    items.push({ str: it.str, x, y, w: it.width || 0, size, ...styleOf(it.fontName) });
+    const item = { str: it.str, x, y, w: it.width || 0, size, link: null, ...styleOf(it.fontName) };
+    for (const piece of splitByLinks(item, links)) if (piece.str) items.push(piece);
   }
 
   const segments = buildSegments(items);
@@ -112,6 +163,82 @@ async function readPage(page, pageNumber) {
   });
 
   return { number: pageNumber, lines, empty: items.length === 0, twoColumns: gutter !== null };
+}
+
+// Liens externes de la page : zones rectangulaires associées à une URL.
+async function readLinks(page) {
+  try {
+    const annotations = await page.getAnnotations();
+    return annotations
+      .filter((a) => a.subtype === "Link" && a.url && a.rect)
+      .map((a) => {
+        const [x1, y1, x2, y2] = a.rect;
+        return { url: a.url, x0: Math.min(x1, x2), x1: Math.max(x1, x2), y0: Math.min(y1, y2), y1: Math.max(y1, y2) };
+      });
+  } catch {
+    return [];
+  }
+}
+
+// Découpe un fragment de texte selon les zones de lien qui le recouvrent.
+// La position des caractères est estimée en supposant une largeur régulière.
+function splitByLinks(item, links) {
+  if (!links.length || !item.w) return [item];
+  const midY = item.y + item.size * 0.3;
+  for (const link of links) {
+    if (midY < link.y0 - 1 || midY > link.y1 + 1) continue;
+    if (link.x1 <= item.x || link.x0 >= item.x + item.w) continue;
+    const n = item.str.length;
+    const charWidth = item.w / n;
+    const start = snapToWord(item.str, clamp(Math.round((link.x0 - item.x) / charWidth), 0, n), "start");
+    const end = snapToWord(item.str, clamp(Math.round((link.x1 - item.x) / charWidth), 0, n), "end");
+    if (end <= start) continue;
+    const part = (a, b, url) => ({ ...item, str: item.str.slice(a, b), x: item.x + a * charWidth, w: (b - a) * charWidth, link: url });
+    const others = links.filter((l) => l !== link);
+    return [
+      ...(start > 0 ? splitByLinks(part(0, start, item.link), others) : []),
+      part(start, end, link.url),
+      ...(end < n ? splitByLinks(part(end, n, item.link), others) : []),
+    ];
+  }
+  return [item];
+}
+
+// Les largeurs de caractères étant estimées, on cale la borne d'un lien sur la limite
+// de mot la plus proche (au plus 4 caractères d'écart).
+function snapToWord(str, index, side) {
+  const isBoundary = (p) => side === "start"
+    ? p === 0 || /\s/.test(str[p - 1])
+    : p === str.length || /[\s.,;:!?)]/.test(str[p]);
+  const trimPunctuation = (p) => (side === "end" && p > 0 && /[.,;:!?]/.test(str[p - 1]) ? p - 1 : p);
+  for (let d = 0; d <= 4; d++) {
+    if (index - d >= 0 && isBoundary(index - d)) return trimPunctuation(index - d);
+    if (index + d <= str.length && isBoundary(index + d)) return trimPunctuation(index + d);
+  }
+  return index;
+}
+
+/* -------------------------------------------------------------------- OCR */
+
+async function renderPage(page) {
+  const viewport = page.getViewport({ scale: OCR_SCALE });
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.ceil(viewport.width);
+  canvas.height = Math.ceil(viewport.height);
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  return canvas;
+}
+
+// Texte brut de l'OCR → paragraphes (lignes recollées, césures retirées).
+function textToParagraphs(text) {
+  return text
+    .split(/\n\s*\n/)
+    .map((p) => p.split("\n").map((s) => s.trim()).filter(Boolean).reduce((a, b) => (a ? joinText(a, b) : b), ""))
+    .filter(Boolean)
+    .map((p) => p.replace(/\*/g, "\\*"));
 }
 
 /* -------------------------------------------------------------- 2. Lignes */
@@ -136,7 +263,7 @@ function buildSegments(items) {
     let seg = null;
     for (const it of row.items) {
       const gap = seg ? it.x - seg.x1 : Infinity;
-      if (!seg || gap > Math.max(it.size, seg.size) * 1.5) {
+      if (!seg || gap > Math.max(it.size, seg.size) * SEGMENT_GAP) {
         seg = { rowId, y: row.y, x0: it.x, x1: it.x + it.w, size: it.size, items: [] };
         segments.push(seg);
       }
@@ -208,16 +335,32 @@ function mergeIntoLines(segments) {
     const last = lines[lines.length - 1];
     if (last && last.rowId === seg.rowId && last.col === seg.col) {
       last.items.push({ gapBefore: true }, ...seg.items);
+      last.segs.push(seg);
       last.x1 = seg.x1;
     } else {
-      lines.push({ rowId: seg.rowId, col: seg.col, y: seg.y, x0: seg.x0, x1: seg.x1, items: [...seg.items] });
+      lines.push({ rowId: seg.rowId, col: seg.col, y: seg.y, x0: seg.x0, x1: seg.x1, items: [...seg.items], segs: [seg] });
     }
   }
   return lines.map(finishLine);
 }
 
+// Texte brut d'une suite de fragments, avec les espaces déduits des écarts.
+function itemsText(items) {
+  let s = "";
+  let prev = null;
+  for (const it of items) {
+    if (prev) {
+      const gap = it.x - (prev.x + prev.w);
+      if (gap > it.size * 0.12 && !/\s$/.test(s) && !/^\s/.test(it.str)) s += " ";
+    }
+    s += it.str;
+    prev = it;
+  }
+  return s.replace(/\s+/g, " ").trim();
+}
+
 function finishLine(line) {
-  // Texte et passages en gras / italique.
+  // Texte et passages en gras / italique / lien.
   const runs = [];
   let prev = null;
   const sizes = new Map();
@@ -245,33 +388,41 @@ function finishLine(line) {
   return {
     col: line.col, y: line.y, x0: line.x0, x1: line.x1,
     runs, plain, size, bold: chars > 0 && boldChars / chars > 0.9,
-    tabular: line.items.some((it) => it.gapBefore),   // éléments espacés sur la ligne (libellé / valeur)
+    segs: line.segs.map((s) => ({ x0: s.x0, x1: s.x1, text: itemsText(s.items) })),
+    tabular: line.segs.length > 1,   // plusieurs blocs espacés sur la ligne (tableau, libellé / valeur)
   };
 }
 
+// Ajoute du texte à la ligne en regroupant les passages de même style.
+// Un espace ajouté (item = null) prend le style du passage précédent.
 function pushText(runs, text, item) {
   const last = runs[runs.length - 1];
   const bold = item ? item.bold : last?.bold ?? false;
   const italic = item ? item.italic : last?.italic ?? false;
-  if (last && last.bold === bold && last.italic === italic) last.text += text;
-  else runs.push({ text, bold, italic });
+  const link = item ? item.link : last?.link ?? null;
+  if (last && last.bold === bold && last.italic === italic && last.link === link) last.text += text;
+  else runs.push({ text, bold, italic, link });
 }
 
-/* ----------------------------------------------- 3 à 5. Analyse du document */
+/* ----------------------------------------------- 3 à 6. Analyse du document */
 
-function buildMarkdown(pages) {
-  if (!pages.some((p) => p.lines.length)) {
-    return "*(Aucun texte extractible : le document est probablement scanné.)*\n";
+function buildMarkdown(pages, { ocr }) {
+  if (!pages.some((p) => p.lines.length || p.ocrBlocks?.length)) {
+    return ocr
+      ? "*(Aucun texte reconnu dans ce document.)*\n"
+      : "*(Aucun texte extractible : le document est probablement scanné. Activez l'option OCR pour le lire.)*\n";
   }
   removeRunningLines(pages);
 
-  const lines = pages.flatMap((p) => p.lines.filter((l) => !l.drop));
-  const bodySize = dominantSize(lines);
+  const bodySize = dominantSize(pages.flatMap((p) => p.lines.filter((l) => !l.drop)));
+  for (const p of pages) detectTables(p);
+
+  const lines = pages.flatMap((p) => p.lines.filter((l) => !l.drop && !l.table));
   const levelBySize = headingLevels(lines, bodySize);
   const boldLevel = clamp(new Set(levelBySize.values()).size + 1, 2, MAX_HEADING_LEVELS);
   for (const l of lines) classify(l, bodySize, levelBySize, boldLevel);
 
-  return assemble(pages, bodySize);
+  return assemble(pages, bodySize, { ocr });
 }
 
 // En-têtes et pieds de page : lignes identiques (aux chiffres près) en haut ou en bas
@@ -299,6 +450,88 @@ function dominantSize(lines) {
   for (const l of lines) count.set(l.size, (count.get(l.size) || 0) + l.plain.length);
   return [...count.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || 10;
 }
+
+/* ------------------------------------------------------------- Tableaux */
+
+// Un tableau est une suite d'au moins deux lignes « à blocs » (plusieurs segments
+// espacés) proches verticalement, dont les blocs s'alignent sur les mêmes colonnes.
+function detectTables(page) {
+  const lines = page.lines.filter((l) => !l.drop);
+  let i = 0;
+  while (i < lines.length) {
+    if (!lines[i].tabular) { i++; continue; }
+    // Lignes candidates : proches verticalement, dans la même colonne de page.
+    let j = i + 1;
+    while (j < lines.length) {
+      const a = lines[j - 1], b = lines[j];
+      const gap = a.y - b.y;
+      if (b.col !== a.col || gap <= 0 || gap > Math.max(a.size, b.size) * TABLE_ROW_GAP) break;
+      j++;
+    }
+    const table = buildTable(lines.slice(i, j));
+    if (table) {
+      table.lines.forEach((l, k) => { l.table = table; l.tableStart = k === 0; });
+      i += table.lines.length;
+    } else {
+      i++;
+    }
+  }
+}
+
+function buildTable(block) {
+  const rowLines = block.filter((l) => l.tabular);
+  if (rowLines.length < 2) return null;
+
+  // Colonnes : zones horizontales couvertes par au moins un bloc, séparées par du vide.
+  const intervals = rowLines.flatMap((l) => l.segs.map((s) => [s.x0, s.x1])).sort((a, b) => a[0] - b[0]);
+  const spans = [];
+  for (const [a, b] of intervals) {
+    const last = spans[spans.length - 1];
+    if (last && a <= last[1] + 2) last[1] = Math.max(last[1], b);
+    else spans.push([a, b]);
+  }
+  if (spans.length < 2 || spans.length > 15) return null;
+
+  const columnOf = (s) => {
+    const c = (s.x0 + s.x1) / 2;
+    const k = spans.findIndex(([a, b]) => c >= a - 1 && c <= b + 1);
+    return k < 0 ? 0 : k;
+  };
+  const fitsOneColumn = (l) =>
+    l.segs.length === 1 && spans.some(([a, b]) => l.segs[0].x0 >= a - 2 && l.segs[0].x1 <= b + 2);
+  const addTo = (row, s) => {
+    const k = columnOf(s);
+    row[k] = row[k] ? row[k] + " " + s.text : s.text;
+  };
+
+  const rows = [];
+  const used = [];
+  for (const l of block) {
+    if (l.tabular) {
+      const row = spans.map(() => "");
+      l.segs.forEach((s) => addTo(row, s));
+      rows.push(row);
+    } else if (rows.length && fitsOneColumn(l)) {
+      addTo(rows[rows.length - 1], l.segs[0]);   // suite d'une cellule sur plusieurs lignes
+    } else {
+      break;
+    }
+    used.push(l);
+  }
+  // Une ligne simple en fin de bloc appartient plutôt au texte qui suit.
+  while (used.length && !used[used.length - 1].tabular) {
+    const l = used.pop();
+    const row = rows[rows.length - 1];
+    const k = columnOf(l.segs[0]);
+    row[k] = row[k].slice(0, row[k].length - l.segs[0].text.length).trim();
+  }
+
+  const filled = rows.filter((r) => r.filter(Boolean).length >= 2).length;
+  if (rows.length < 2 || filled < rows.length * 0.6) return null;
+  return { lines: used, md: tableToMd(rows) };
+}
+
+/* ---------------------------------------------------------------- Titres */
 
 // Tailles plus grandes que le texte courant → niveaux de titre (# ## ### ####).
 function headingLevels(lines, bodySize) {
@@ -335,7 +568,9 @@ function classify(l, bodySize, levelBySize, boldLevel) {
   l.md = runsToMd(l.runs, 0);
 }
 
-// Texte Markdown d'une ligne avec gras / italique, en sautant `skip` caractères (puce).
+/* ------------------------------------------------------- Texte Markdown */
+
+// Texte Markdown d'une ligne avec gras / italique / liens, en sautant `skip` caractères (puce).
 function runsToMd(runs, skip) {
   let out = "";
   let remaining = skip;
@@ -348,7 +583,9 @@ function runsToMd(runs, skip) {
     }
     if (!t) continue;
     t = t.replace(/\s+/g, " ").replace(/\*/g, "\\*");
-    out += wrap(t, r.bold, r.italic);
+    let piece = wrap(t, r.bold, r.italic);
+    if (r.link) piece = linkify(piece, r.link);
+    out += piece;
   }
   return out.replace(/^\s+/, "").replace(/^#/, "\\#");
 }
@@ -361,13 +598,21 @@ function wrap(text, bold, italic) {
   return m[1] + mark + m[2] + mark + m[3];
 }
 
+function linkify(text, url) {
+  const m = text.match(/^(\s*)([\s\S]*?)(\s*)$/);
+  if (!m[2]) return text;
+  const safeUrl = url.replace(/ /g, "%20").replace(/\(/g, "%28").replace(/\)/g, "%29");
+  return `${m[1]}[${m[2].replace(/([[\]])/g, "\\$1")}](${safeUrl})${m[3]}`;
+}
+
 function joinText(a, b) {
   if (/\p{L}-$/u.test(a) && /^\p{Ll}/u.test(b)) return a.slice(0, -1) + b;   // césure
   return a + " " + b;
 }
 
-// Assemble les lignes en blocs Markdown.
-function assemble(pages, bodySize) {
+/* ------------------------------------------------------------ Assemblage */
+
+function assemble(pages, bodySize, { ocr }) {
   const blocks = [];
   let cur = null;     // bloc en cours : { type, text, level?, depth?, x0? }
   let prev = null;    // ligne précédente
@@ -375,9 +620,21 @@ function assemble(pages, bodySize) {
   const close = () => { if (cur) blocks.push(cur); cur = null; };
 
   for (const page of pages) {
+    if (page.ocrBlocks) {
+      close();
+      prev = null;
+      listBase = null;
+      if (page.ocrBlocks.length) page.ocrBlocks.forEach((text) => blocks.push({ type: "text", text }));
+      else blocks.push({ type: "note", text: `*(Page ${page.number} : aucun texte reconnu.)*` });
+      continue;
+    }
     const lines = page.lines.filter((l) => !l.drop);
     if (!lines.length) {
-      if (page.empty) { close(); blocks.push({ type: "note", text: `*(Page ${page.number} sans texte extractible, probablement scannée.)*` }); }
+      if (page.empty) {
+        close();
+        const hint = ocr ? "" : " Activez l'option OCR pour la lire.";
+        blocks.push({ type: "note", text: `*(Page ${page.number} sans texte extractible, probablement scannée.${hint})*` });
+      }
       continue;
     }
 
@@ -387,7 +644,7 @@ function assemble(pages, bodySize) {
     lines.forEach((l, i) => {
       if (l.kind === "text") margins[l.col] = Math.min(margins[l.col] ?? Infinity, l.x0);
       const p = lines[i - 1];
-      if (p && p.col === l.col && p.kind !== "heading" && l.kind !== "heading") {
+      if (p && p.col === l.col && p.kind === "text" && l.kind === "text") {
         const d = p.y - l.y;
         if (d > 0 && d < bodySize * 3) gaps.push(d);
       }
@@ -398,7 +655,10 @@ function assemble(pages, bodySize) {
       const sameFlow = prev && prev.page === l.page && prev.col === l.col;
       const gap = sameFlow ? prev.y - l.y : Infinity;
 
-      if (l.kind === "heading") {
+      if (l.table) {
+        if (l.tableStart) { close(); blocks.push({ type: "table", text: l.table.md }); }
+        listBase = null;
+      } else if (l.kind === "heading") {
         const continues = cur?.type === "heading" && cur.level === l.level && sameFlow && gap < l.size * 1.8;
         if (continues) cur.text += " " + l.plain.trim();
         else { close(); cur = { type: "heading", level: l.level, text: l.plain.trim() }; }

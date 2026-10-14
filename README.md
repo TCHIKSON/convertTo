@@ -20,11 +20,14 @@ La conversion se fait entièrement dans le navigateur. Les fichiers ne sont envo
 - Le **gras** et l'**italique** sont conservés dans le texte.
 - Les **puces** et les listes numérotées deviennent des listes Markdown, imbriquées selon leur retrait.
 - Les mots coupés en fin de ligne sont recollés, et un paragraphe qui continue sur la page ou la colonne suivante reste d'un seul tenant.
+- Les **tableaux** sont reconstitués à partir de l'alignement du texte, y compris les cellules sur plusieurs lignes et les montants alignés à droite.
+- Les **liens hypertextes** sont conservés sous la forme `[texte](adresse)`.
+- Pour un **PDF protégé**, une fenêtre demande le mot de passe. Il sert uniquement à ouvrir le fichier et n'est jamais conservé.
+- L'option **OCR** lit les pages scannées avec Tesseract.js, en français et en anglais. Le moteur est téléchargé au premier usage (environ 15 Mo), puis l'analyse se fait sur votre appareil.
 
 Limites actuelles :
-- Les tableaux des PDF ne sont pas reconstitués : chaque ligne d'un tableau ressort sur sa propre ligne de texte.
-- Les PDF scannés, qui ne contiennent que des images, ne produisent pas de texte.
-- Les PDF protégés par mot de passe ne sont pas pris en charge.
+- Les tableaux sans espace net entre les colonnes, ou dont une cellule déborde sur la colonne voisine, peuvent être mal découpés. La première ligne d'un tableau est toujours prise comme en-tête.
+- L'OCR ne reconnaît que le texte brut : pas de titres, de gras ni de tableaux sur les pages scannées.
 - Les images ne sont pas intégrées au Markdown, quel que soit le format.
 - Les anciens fichiers Word `.doc` ne sont pas pris en charge. Il faut les réenregistrer en `.docx`.
 
@@ -39,6 +42,7 @@ js/converters/pdf.js       PDF  → Markdown (pdf.js)
 js/converters/docx.js      Word → Markdown (mammoth + Turndown)
 js/converters/xlsx.js      Tableurs → Markdown (SheetJS)
 js/utils/markdown.js       Fonctions communes (tableaux, nettoyage)
+js/utils/ocr.js            OCR avec Tesseract.js, chargé à la demande
 cli/convert_to_md.py       Version en ligne de commande (Python)
 ```
 
@@ -46,8 +50,18 @@ L'interface n'appelle qu'une seule fonction :
 
 ```js
 import { convertToMd } from "./convert.js";
-const markdown = await convertToMd(file);
+const markdown = await convertToMd(file, {
+  onProgress: (done, total, label) => {},    // progression (« Page 3 / 12 »)
+  ocr: true,                                 // OCR des pages scannées (PDF)
+  requestPassword: async (fileName, retry) => "mot de passe" /* ou null pour annuler */,
+});
 ```
+
+Toutes les options sont facultatives. Chaque convertisseur utilise celles qui le concernent.
+
+### Améliorer la conversion PDF
+
+Tout se passe dans `js/converters/pdf.js`. Les réglages principaux sont des constantes en haut du fichier (`SEGMENT_GAP`, `TABLE_ROW_GAP`, `ZONE`, `BULLET`…). Chaque étape a sa fonction : `readPage`, `findGutter`, `removeRunningLines`, `detectTables`, `headingLevels`, `classify` et `assemble`.
 
 ### Ajouter un format
 
@@ -108,4 +122,5 @@ python cli/convert_to_md.py mon_dossier/ -r -o sortie/
 - [SheetJS](https://sheetjs.com/) pour la lecture des tableurs
 - [JSZip](https://stuk.github.io/jszip/) pour l'archive `.zip`
 - [marked](https://marked.js.org/) et [DOMPurify](https://github.com/cure53/DOMPurify) pour l'aperçu
+- [Tesseract.js](https://tesseract.projectnaptha.com/) pour l'OCR
 - [PrimeIcons](https://primevue.org/icons/) pour les icônes

@@ -170,6 +170,49 @@ pre.source {
 
 footer { margin-top: 32px; color: var(--muted); font-size: 12px; text-align: center; }
 
+/* Options */
+.options {
+  display: flex; align-items: center; gap: 8px 16px; flex-wrap: wrap;
+  margin-top: 14px; padding: 12px 16px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.options .hint { color: var(--muted); font-size: 12px; }
+.switch { display: inline-flex; align-items: center; gap: 10px; cursor: pointer; user-select: none; }
+.switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.switch .track {
+  position: relative; width: 34px; height: 20px; border-radius: 999px; flex: none;
+  background: var(--border); transition: background .15s;
+}
+.switch .track::after {
+  content: ""; position: absolute; top: 3px; left: 3px; width: 14px; height: 14px;
+  border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, .2); transition: transform .15s;
+}
+.switch input:checked + .track { background: var(--primary); }
+.switch input:checked + .track::after { transform: translateX(14px); }
+.switch input:focus-visible + .track { outline: 2px solid var(--primary); outline-offset: 2px; }
+.switch-label { display: inline-flex; align-items: center; gap: 8px; font-weight: 500; }
+.switch-label .pi { color: var(--muted); }
+
+/* Fenêtre de dialogue */
+.dialog {
+  width: min(400px, calc(100% - 32px)); padding: 0; border: 1px solid var(--border);
+  border-radius: 12px; background: var(--surface); color: var(--text);
+  box-shadow: 0 12px 32px rgba(16, 24, 40, .18);
+}
+.dialog::backdrop { background: rgba(15, 18, 24, .45); }
+.dialog form { padding: 20px; display: flex; flex-direction: column; gap: 12px; }
+.dialog-head { display: flex; align-items: center; gap: 10px; }
+.dialog-head .pi { color: var(--primary); font-size: 16px; }
+.dialog-head h3 { margin: 0; font-size: 15px; font-weight: 600; }
+.dialog-text { margin: 0; color: var(--muted); overflow-wrap: anywhere; }
+.dialog-error { margin: 0; color: var(--danger); font-size: 13px; display: flex; align-items: center; gap: 6px; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+.input {
+  height: 38px; padding: 0 12px; border-radius: 8px; border: 1px solid var(--border);
+  background: var(--bg); color: var(--text); font: inherit;
+}
+.input:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
+
 @media (max-width: 600px) {
   .wrap { padding-top: 24px; }
   .file { grid-template-columns: 32px 1fr; }
